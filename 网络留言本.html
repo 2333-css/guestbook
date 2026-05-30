@@ -1,0 +1,900 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>网络留言本 - Vue3纯前端版</title>
+  <!-- 引入Vue3 CDN -->
+  <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+  <!-- 引入Vue Router CDN -->
+  <script src="https://unpkg.com/vue-router@4/dist/vue-router.global.js"></script>
+  <!-- 引入MD5加密 -->
+  <script src="https://unpkg.com/crypto-js@4.2.0/crypto-js.js"></script>
+  <!-- 引入Tailwind CSS美化 -->
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-100 min-h-screen">
+  <div id="app"></div>
+
+  <script>
+    // 仅删除无效的useRouter，其他代码完全不动
+    const { createApp, ref, reactive, computed, onMounted, watch } = Vue;
+    const { createRouter, createWebHashHistory } = VueRouter;
+
+    // ==================== 数据层：模拟数据库（localStorage） ====================
+    const DB = {
+      // 初始化数据库
+      init() {
+        if (!localStorage.getItem('admin')) {
+          // 初始管理员账号：admin 密码：123456
+          localStorage.setItem('admin', JSON.stringify({
+            id: 1,
+            username: 'admin',
+            password: CryptoJS.MD5('123456').toString()
+          }));
+        }
+        if (!localStorage.getItem('messages')) {
+          localStorage.setItem('messages', JSON.stringify([
+            {
+              id: 1,
+              name: '测试用户',
+              title: '测试留言',
+              content: '这是一条测试留言，系统运行正常！',
+              createTime: new Date().toLocaleString(),
+              reply: '收到，感谢测试！',
+              replyTime: new Date().toLocaleString(),
+              status: 1, // 0=审核中 1=已通过 2=已拒绝
+              replies: []
+            }
+          ]));
+        }
+      },
+
+      // 管理员操作
+      getAdmin() {
+        return JSON.parse(localStorage.getItem('admin'));
+      },
+      updateAdminPassword(newPwd) {
+        const admin = this.getAdmin();
+        admin.password = CryptoJS.MD5(newPwd).toString();
+        localStorage.setItem('admin', JSON.stringify(admin));
+        return true;
+      },
+      login(username, password) {
+        const admin = this.getAdmin();
+        return admin.username === username && admin.password === CryptoJS.MD5(password).toString();
+      },
+
+      // 留言操作
+      getMessages() {
+        return JSON.parse(localStorage.getItem('messages') || '[]');
+      },
+      addMessage(msg) {
+        const messages = this.getMessages();
+        msg.id = Date.now();
+        msg.createTime = new Date().toLocaleString();
+        msg.status = 0; // 默认未审核
+        msg.replies = [];
+        messages.unshift(msg);
+        localStorage.setItem('messages', JSON.stringify(messages));
+        return true;
+      },
+      auditMessage(id) {
+        const messages = this.getMessages();
+        const msg = messages.find(m => m.id === id);
+        if (msg) {
+          msg.status = 1;
+          msg.auditTime = new Date().toLocaleString();
+          localStorage.setItem('messages', JSON.stringify(messages));
+          return true;
+        }
+        return false;
+      },
+      // 新增：拒绝留言并填写原因
+      rejectMessage(id, reason) {
+        const messages = this.getMessages();
+        const msg = messages.find(m => m.id === id);
+        if (msg) {
+          msg.status = 2;
+          msg.rejectReason = reason;
+          msg.rejectTime = new Date().toLocaleString();
+          localStorage.setItem('messages', JSON.stringify(messages));
+          return true;
+        }
+        return false;
+      },
+      // ✅ 修复：管理员回复后自动审核通过，前台用户可立即查看
+      replyMessage(id, reply) {
+        const messages = this.getMessages();
+        const msg = messages.find(m => m.id === id);
+        if (msg) {
+          msg.reply = reply;
+          msg.replyTime = new Date().toLocaleString();
+          msg.status = 1; // 回复后自动标记为已审核
+          localStorage.setItem('messages', JSON.stringify(messages));
+          return true;
+        }
+        return false;
+      },
+      deleteMessage(id) {
+        const messages = this.getMessages().filter(m => m.id !== id);
+        localStorage.setItem('messages', JSON.stringify(messages));
+        return true;
+      },
+      searchMessages(keyword) {
+        return this.getMessages().filter(m =>
+          m.status === 1 && (
+            m.name.includes(keyword) ||
+            m.title.includes(keyword)
+          )
+        );
+      },
+      // 新增：根据昵称获取用户所有留言
+      getUserMessages(name) {
+        return this.getMessages().filter(m => m.name === name);
+      },
+      // 新增用户回复功能
+      addReply(messageId, reply) {
+        const messages = this.getMessages();
+        const msg = messages.find(m => m.id === messageId);
+        if (msg) {
+          reply.id = Date.now();
+          reply.createTime = new Date().toLocaleString();
+          msg.replies = msg.replies || [];
+          msg.replies.push(reply);
+          localStorage.setItem('messages', JSON.stringify(messages));
+          return true;
+        }
+        return false;
+      }
+    };
+
+    // ==================== 页面组件 ====================
+    // 前台首页
+    const HomePage = {
+      template: `
+                <div class="max-w-4xl mx-auto p-6">
+                    <!-- 导航栏 -->
+                    <nav class="bg-white shadow rounded-lg p-4 mb-6 flex justify-between items-center">
+                        <h1 class="text-2xl font-bold text-blue-600">简易网络留言本</h1>
+                        <div>
+                            <router-link to="/" class="text-gray-700 hover:text-blue-600 mr-4" :class="{ 'text-blue-600 font-semibold': activeTab === 'home' }" @click="activeTab = 'home'">首页</router-link>
+                            <button @click="activeTab = 'my'" class="text-gray-700 hover:text-blue-600 mr-4" :class="{ 'text-blue-600 font-semibold': activeTab === 'my' }">留言记录</button>
+                            <router-link to="/admin/login" class="text-gray-700 hover:text-blue-600">后台管理</router-link>
+                        </div>
+                    </nav>
+
+                    <!-- 提示信息 -->
+                    <div v-if="message" class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded mb-6">
+                        {{ message }}
+                    </div>
+
+                    <!-- 首页内容 -->
+                    <div v-if="activeTab === 'home'">
+                        <!-- 留言提交表单 -->
+                        <div class="bg-white shadow rounded-lg p-6 mb-6">
+                            <h2 class="text-xl font-semibold mb-4">发表留言</h2>
+                            <form @submit.prevent="submitMessage">
+                                <div class="mb-4">
+                                    <label class="block text-gray-700 mb-2">昵称</label>
+                                    <input 
+                                        v-model="form.name" 
+                                        type="text" 
+                                        class="w-full border border-gray-300 rounded px-3 py-2"
+                                        placeholder="请输入您的昵称"
+                                        required
+                                    >
+                                </div>
+                                <div class="mb-4">
+                                    <label class="block text-gray-700 mb-2">留言标题</label>
+                                    <input 
+                                        v-model="form.title" 
+                                        type="text" 
+                                        class="w-full border border-gray-300 rounded px-3 py-2"
+                                        placeholder="请输入留言标题"
+                                        required
+                                    >
+                                </div>
+                                <div class="mb-4">
+                                    <label class="block text-gray-700 mb-2">留言内容</label>
+                                    <textarea 
+                                        v-model="form.content" 
+                                        class="w-full border border-gray-300 rounded px-3 py-2"
+                                        rows="4"
+                                        placeholder="请输入留言内容"
+                                        required
+                                    ></textarea>
+                                </div>
+                                <button 
+                                    type="submit" 
+                                    class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700"
+                                    :disabled="submitting"
+                                >
+                                    {{ submitting ? '提交中...' : '提交留言' }}
+                                </button>
+                                <button type="reset" class="ml-2 bg-gray-200 text-gray-700 px-4 py-2 rounded hover:bg-gray-300">
+                                    重置
+                                </button>
+                            </form>
+                        </div>
+
+                        <!-- 搜索框 -->
+                        <div class="bg-white shadow rounded-lg p-4 mb-6">
+                            <div class="flex">
+                                <input 
+                                    v-model="keyword" 
+                                    type="text" 
+                                    class="flex-1 border border-gray-300 rounded-l px-3 py-2"
+                                    placeholder="搜索昵称或留言标题"
+                                >
+                                <button 
+                                    @click="search" 
+                                    class="bg-blue-600 text-white px-4 py-2 rounded-r hover:bg-blue-700"
+                                >
+                                    搜索
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- 留言列表 -->
+                        <div class="space-y-4">
+                            <div v-for="msg in displayedMessages" :key="msg.id" class="bg-white shadow rounded-lg p-6">
+                                <h3 class="text-lg font-semibold text-gray-800 mb-2">{{ msg.title }}</h3>
+                                <div class="text-sm text-gray-500 mb-3">
+                                    <span>用户：{{ msg.name }}</span>
+                                    <span class="ml-4">发表时间：{{ msg.createTime }}</span>
+                                </div>
+                                <p class="text-gray-700 mb-4">{{ msg.content }}</p>
+                                
+                                <!-- 管理员回复显示区域（已存在，无需修改） -->
+                                <div v-if="msg.reply" class="bg-blue-50 border-l-4 border-blue-500 p-4 rounded">
+                                    <p class="text-blue-700 font-medium">管理员回复：</p>
+                                    <p class="text-blue-600">{{ msg.reply }}</p>
+                                    <p class="text-sm text-blue-500 mt-1">回复时间：{{ msg.replyTime }}</p>
+                                </div>
+
+                                <!-- 新增：用户回复列表 -->
+                                <div v-if="msg.replies && msg.replies.length > 0" class="mt-4 space-y-3">
+                                    <h4 class="text-sm font-medium text-gray-700">用户回复：</h4>
+                                    <div v-for="reply in msg.replies" :key="reply.id" class="bg-gray-50 border-l-4 border-gray-400 p-3 rounded">
+                                        <p class="text-gray-800">{{ reply.content }}</p>
+                                        <p class="text-xs text-gray-500 mt-1">
+                                            <span>{{ reply.name }}</span> · {{ reply.createTime }}
+                                        </p>
+                                    </div>
+                                </div>
+
+                                <!-- 新增：用户回复按钮和表单 -->
+                                <div class="mt-4">
+                                    <button 
+                                        @click="showReplyForm(msg.id)" 
+                                        class="text-sm text-blue-600 hover:text-blue-800"
+                                    >
+                                        回复这条留言
+                                    </button>
+                                    
+                                    <div v-if="replyForm.show && replyForm.messageId === msg.id" class="mt-3 bg-gray-50 p-4 rounded">
+                                        <form @submit.prevent="submitReply(msg.id)">
+                                            <div class="mb-3">
+                                                <label class="block text-sm text-gray-700 mb-1">您的昵称</label>
+                                                <input 
+                                                    v-model="replyForm.name" 
+                                                    type="text" 
+                                                    class="w-full border border-gray-300 rounded px-3 py-2 text-sm"
+                                                    placeholder="请输入您的昵称"
+                                                    required
+                                                >
+                                            </div>
+                                            <div class="mb-3">
+                                                <label class="block text-sm text-gray-700 mb-1">回复内容</label>
+                                                <textarea 
+                                                    v-model="replyForm.content" 
+                                                    class="w-full border border-gray-300 rounded px-3 py-2 text-sm"
+                                                    rows="2"
+                                                    placeholder="请输入回复内容"
+                                                    required
+                                                ></textarea>
+                                            </div>
+                                            <div class="flex space-x-2">
+                                                <button 
+                                                    type="submit" 
+                                                    class="bg-blue-600 text-white px-3 py-1 rounded text-sm hover:bg-blue-700"
+                                                >
+                                                    提交回复
+                                                </button>
+                                                <button 
+                                                    type="button" 
+                                                    @click="hideReplyForm" 
+                                                    class="bg-gray-200 text-gray-700 px-3 py-1 rounded text-sm hover:bg-gray-300"
+                                                >
+                                                    取消
+                                                </button>
+                                            </div>
+                                        </form>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div v-if="displayedMessages.length === 0" class="text-center text-gray-500 py-12">
+                                暂无留言
+                            </div>
+                        </div>
+
+                        <!-- 分页 -->
+                        <div v-if="totalPages > 1" class="flex justify-center mt-8 space-x-2">
+                            <button 
+                                @click="currentPage = 1" 
+                                class="px-3 py-1 rounded border"
+                                :disabled="currentPage === 1"
+                            >
+                                首页
+                            </button>
+                            <button 
+                                @click="currentPage--" 
+                                class="px-3 py-1 rounded border"
+                                :disabled="currentPage === 1"
+                            >
+                                上一页
+                            </button>
+                            <span class="px-3 py-1">{{ currentPage }} / {{ totalPages }}</span>
+                            <button 
+                                @click="currentPage++" 
+                                class="px-3 py-1 rounded border"
+                                :disabled="currentPage === totalPages"
+                            >
+                                下一页
+                            </button>
+                            <button 
+                                @click="currentPage = totalPages" 
+                                class="px-3 py-1 rounded border"
+                                :disabled="currentPage === totalPages"
+                            >
+                                末页
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- 我的留言记录 -->
+                    <div v-else>
+                        <div class="bg-white shadow rounded-lg p-6 mb-6">
+                            <h2 class="text-xl font-semibold mb-4">我的留言记录</h2>
+                            <div class="mb-4 flex">
+                                <input 
+                                    v-model="myNickname" 
+                                    type="text" 
+                                    class="flex-1 border border-gray-300 rounded-l px-3 py-2"
+                                    placeholder="请输入您的昵称查看留言记录"
+                                >
+                                <button 
+                                    @click="loadMyMessages" 
+                                    class="bg-blue-600 text-white px-4 py-2 rounded-r hover:bg-blue-700"
+                                >
+                                    查询
+                                </button>
+                            </div>
+
+                            <div v-if="myMessages.length > 0" class="space-y-4">
+                                <div v-for="msg in myMessages" :key="msg.id" class="border rounded-lg p-4" :class="getStatusClass(msg.status)">
+                                    <div class="flex justify-between items-start mb-2">
+                                        <h3 class="text-lg font-semibold">{{ msg.title }}</h3>
+                                        <span class="px-2 py-1 rounded text-xs" :class="getStatusBadgeClass(msg.status)">
+                                            {{ getStatusText(msg.status) }}
+                                        </span>
+                                    </div>
+                                    <p class="text-sm text-gray-500 mb-2">发表时间：{{ msg.createTime }}</p>
+                                    <p class="text-gray-700 mb-3">{{ msg.content }}</p>
+                                    
+                                    <!-- 管理员回复 -->
+                                    <div v-if="msg.reply" class="bg-blue-50 border-l-4 border-blue-500 p-3 rounded mb-2">
+                                        <p class="text-blue-700 font-medium text-sm">管理员回复：</p>
+                                        <p class="text-blue-600">{{ msg.reply }}</p>
+                                        <p class="text-xs text-blue-500 mt-1">回复时间：{{ msg.replyTime }}</p>
+                                    </div>
+                                    
+                                    <!-- 拒绝原因 -->
+                                    <div v-if="msg.status === 2 && msg.rejectReason" class="bg-red-50 border-l-4 border-red-500 p-3 rounded">
+                                        <p class="text-red-700 font-medium text-sm">拒绝原因：</p>
+                                        <p class="text-red-600">{{ msg.rejectReason }}</p>
+                                        <p class="text-xs text-red-500 mt-1">拒绝时间：{{ msg.rejectTime }}</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div v-else class="text-center text-gray-500 py-8">
+                                {{ myNickname ? '暂无您的留言记录' : '请输入您的昵称查询留言记录' }}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `,
+      setup() {
+        const form = reactive({ name: '', title: '', content: '' });
+        const submitting = ref(false);
+        const message = ref('');
+        const keyword = ref('');
+        const currentPage = ref(1);
+        const pageSize = 10;
+        const allMessages = ref([]);
+        const activeTab = ref('home');
+        const myNickname = ref(localStorage.getItem('lastNickname') || '');
+        const myMessages = ref([]);
+        // 新增：用户回复表单状态
+        const replyForm = reactive({
+          show: false,
+          messageId: null,
+          name: '',
+          content: ''
+        });
+
+        // 加载已审核留言
+        const loadMessages = () => {
+          allMessages.value = DB.getMessages().filter(m => m.status === 1);
+        };
+
+        // 提交留言
+        const submitMessage = () => {
+          submitting.value = true;
+          setTimeout(() => {
+            DB.addMessage({ ...form });
+            // 保存用户昵称到本地存储
+            localStorage.setItem('lastNickname', form.name);
+            message.value = '留言提交成功，请等待管理员审核';
+            form.name = '';
+            form.title = '';
+            form.content = '';
+            submitting.value = false;
+            // 3秒后清除提示
+            setTimeout(() => message.value = '', 3000);
+          }, 500);
+        };
+
+        // 搜索留言
+        const search = () => {
+          if (keyword.value.trim()) {
+            allMessages.value = DB.searchMessages(keyword.value.trim());
+          } else {
+            loadMessages();
+          }
+          currentPage.value = 1;
+        };
+
+        // 新增：显示回复表单
+        const showReplyForm = (messageId) => {
+          replyForm.show = true;
+          replyForm.messageId = messageId;
+          replyForm.name = localStorage.getItem('lastNickname') || '';
+          replyForm.content = '';
+        };
+
+        // 新增：隐藏回复表单
+        const hideReplyForm = () => {
+          replyForm.show = false;
+          replyForm.messageId = null;
+        };
+
+        // 新增：提交用户回复
+        const submitReply = (messageId) => {
+          DB.addReply(messageId, {
+            name: replyForm.name,
+            content: replyForm.content
+          });
+          hideReplyForm();
+          loadMessages();
+          message.value = '回复提交成功';
+          setTimeout(() => message.value = '', 3000);
+        };
+
+        // 加载我的留言
+        const loadMyMessages = () => {
+          if (myNickname.value.trim()) {
+            myMessages.value = DB.getUserMessages(myNickname.value.trim());
+          }
+        };
+
+        // 获取状态文本
+        const getStatusText = (status) => {
+          switch (status) {
+            case 0: return '审核中';
+            case 1: return '已通过';
+            case 2: return '已拒绝';
+            default: return '未知';
+          }
+        };
+
+        // 获取状态徽章样式
+        const getStatusBadgeClass = (status) => {
+          switch (status) {
+            case 0: return 'bg-yellow-100 text-yellow-800';
+            case 1: return 'bg-green-100 text-green-800';
+            case 2: return 'bg-red-100 text-red-800';
+            default: return 'bg-gray-100 text-gray-800';
+          }
+        };
+
+        // 获取状态卡片样式
+        const getStatusClass = (status) => {
+          switch (status) {
+            case 0: return 'border-yellow-200 bg-yellow-50';
+            case 1: return 'border-green-200 bg-green-50';
+            case 2: return 'border-red-200 bg-red-50';
+            default: return '';
+          }
+        };
+
+        // 分页计算
+        const totalPages = computed(() => Math.ceil(allMessages.value.length / pageSize));
+        const displayedMessages = computed(() => {
+          const start = (currentPage.value - 1) * pageSize;
+          return allMessages.value.slice(start, start + pageSize);
+        });
+
+        onMounted(() => {
+          DB.init();
+          loadMessages();
+          // 如果有保存的昵称，自动加载留言
+          if (myNickname.value) {
+            loadMyMessages();
+          }
+        });
+
+        return {
+          form, submitting, message, keyword, currentPage, replyForm, activeTab, myNickname, myMessages,
+          loadMessages, submitMessage, search, showReplyForm, hideReplyForm, submitReply, loadMyMessages,
+          getStatusText, getStatusBadgeClass, getStatusClass,
+          totalPages, displayedMessages
+        };
+      }
+    };
+
+    // 管理员登录页
+    const AdminLoginPage = {
+      template: `
+                <div class="min-h-screen flex items-center justify-center">
+                    <div class="bg-white shadow rounded-lg p-8 w-full max-w-md">
+                        <h2 class="text-2xl font-bold text-center mb-6">管理员登录</h2>
+                        <form @submit.prevent="login">
+                            <div class="mb-4">
+                                <label class="block text-gray-700 mb-2">账号</label>
+                                <input 
+                                    v-model="form.username" 
+                                    type="text" 
+                                    class="w-full border border-gray-300 rounded px-3 py-2"
+                                    placeholder="请输入管理员账号"
+                                    required
+                                >
+                            </div>
+                            <div class="mb-6">
+                                <label class="block text-gray-700 mb-2">密码</label>
+                                <input 
+                                    v-model="form.password" 
+                                    type="password" 
+                                    class="w-full border border-gray-300 rounded px-3 py-2"
+                                    placeholder="请输入密码"
+                                    required
+                                >
+                            </div>
+                            <div v-if="error" class="text-red-500 mb-4">{{ error }}</div>
+                            <button 
+                                type="submit" 
+                                class="w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700"
+                            >
+                                登录
+                            </button>
+                        </form>
+                        <div class="text-center mt-4">
+                            <router-link to="/" class="text-blue-600 hover:underline">返回首页</router-link>
+                        </div>
+                    </div>
+                </div>
+            `,
+      // 修复：直接使用全局router对象，删除无效的useRouter
+      setup() {
+        const form = reactive({ username: '', password: '' });
+        const error = ref('');
+
+        const login = () => {
+          if (DB.login(form.username, form.password)) {
+            localStorage.setItem('isLoggedIn', 'true');
+            router.push('/admin');
+          } else {
+            error.value = '账号或密码错误';
+          }
+        };
+
+        onMounted(() => DB.init());
+
+        return { form, error, login };
+      }
+    };
+
+    // 后台管理主页
+    const AdminHomePage = {
+      template: `
+                <div class="min-h-screen flex">
+                    <!-- 侧边栏 -->
+                    <div class="w-64 bg-gray-800 text-white">
+                        <div class="p-4 text-xl font-bold border-b border-gray-700">
+                            留言本管理后台
+                        </div>
+                        <nav class="p-4">
+                            <router-link 
+                                to="/admin" 
+                                class="block py-2 px-4 rounded hover:bg-gray-700 mb-2"
+                                :class="{ 'bg-gray-700': $route.path === '/admin' }"
+                            >
+                                留言管理
+                            </router-link>
+                            <router-link 
+                                to="/admin/password" 
+                                class="block py-2 px-4 rounded hover:bg-gray-700 mb-2"
+                                :class="{ 'bg-gray-700': $route.path === '/admin/password' }"
+                            >
+                                修改密码
+                            </router-link>
+                            <button 
+                                @click="logout" 
+                                class="w-full text-left py-2 px-4 rounded hover:bg-gray-700 text-red-400"
+                            >
+                                安全退出
+                            </button>
+                        </nav>
+                    </div>
+
+                    <!-- 主内容区 -->
+                    <div class="flex-1 p-6">
+                        <router-view></router-view>
+                    </div>
+                </div>
+            `,
+      // 修复：直接使用全局router对象，删除无效的useRouter
+      setup() {
+        const logout = () => {
+          localStorage.removeItem('isLoggedIn');
+          router.push('/admin/login');
+        };
+
+        // 路由守卫
+        onMounted(() => {
+          if (!localStorage.getItem('isLoggedIn')) {
+            router.push('/admin/login');
+          }
+        });
+
+        return { logout };
+      }
+    };
+
+    // 留言管理页面
+    const MessageManagePage = {
+      template: `
+                <div>
+                    <h2 class="text-2xl font-bold mb-6">留言管理</h2>
+                    
+                    <!-- 提示信息 -->
+                    <div v-if="message" class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded mb-6">
+                        {{ message }}
+                    </div>
+
+                    <!-- 留言列表 -->
+                    <div class="bg-white shadow rounded-lg overflow-hidden">
+                        <table class="w-full">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">ID</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">昵称</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">标题</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">时间</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">状态</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-200">
+                                <tr v-for="msg in messages" :key="msg.id">
+                                    <td class="px-6 py-4 whitespace-nowrap">{{ msg.id }}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap">{{ msg.name }}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap">{{ msg.title }}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap">{{ msg.createTime }}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap">
+                                        <span 
+                                            class="px-2 py-1 rounded text-xs"
+                                            :class="getStatusBadgeClass(msg.status)"
+                                        >
+                                            {{ getStatusText(msg.status) }}
+                                        </span>
+                                    </td>
+                                    <td class="px-6 py-4 whitespace-nowrap space-x-2">
+                                        <button 
+                                            v-if="msg.status === 0"
+                                            @click="audit(msg.id)" 
+                                            class="text-green-600 hover:text-green-900"
+                                        >
+                                            同意
+                                        </button>
+                                        <button 
+                                            @click="reject(msg.id)" 
+                                            class="text-red-600 hover:text-red-900"
+                                        >
+                                            拒绝
+                                        </button>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                        <div v-if="messages.length === 0" class="text-center text-gray-500 py-12">
+                            暂无留言
+                        </div>
+                    </div>
+                </div>
+            `,
+      setup() {
+        const messages = ref([]);
+        const message = ref('');
+
+        const loadMessages = () => {
+          messages.value = DB.getMessages();
+        };
+
+        const audit = (id) => {
+          DB.auditMessage(id);
+          message.value = '留言已通过审核';
+          loadMessages();
+          setTimeout(() => message.value = '', 3000);
+        };
+
+        const reject = (id) => {
+          const reason = prompt('请输入拒绝原因：');
+          if (reason !== null && reason.trim() !== '') {
+            DB.rejectMessage(id, reason.trim());
+            message.value = '留言已拒绝并通知用户';
+            loadMessages();
+            setTimeout(() => message.value = '', 3000);
+          }
+        };
+
+        // 获取状态文本
+        const getStatusText = (status) => {
+          switch (status) {
+            case 0: return '审核中';
+            case 1: return '已通过';
+            case 2: return '已拒绝';
+            default: return '未知';
+          }
+        };
+
+        // 获取状态徽章样式
+        const getStatusBadgeClass = (status) => {
+          switch (status) {
+            case 0: return 'bg-yellow-100 text-yellow-800';
+            case 1: return 'bg-green-100 text-green-800';
+            case 2: return 'bg-red-100 text-red-800';
+            default: return 'bg-gray-100 text-gray-800';
+          }
+        };
+
+        onMounted(loadMessages);
+
+        return {
+          messages, message,
+          loadMessages, audit, reject,
+          getStatusText, getStatusBadgeClass
+        };
+      }
+    };
+
+    // 修改密码页面
+    const UpdatePasswordPage = {
+      template: `
+                <div>
+                    <h2 class="text-2xl font-bold mb-6">修改密码</h2>
+                    
+                    <div class="bg-white shadow rounded-lg p-6 max-w-md">
+                        <form @submit.prevent="updatePwd">
+                            <div class="mb-4">
+                                <label class="block text-gray-700 mb-2">原密码</label>
+                                <input 
+                                    v-model="form.oldPwd" 
+                                    type="password" 
+                                    class="w-full border border-gray-300 rounded px-3 py-2"
+                                    required
+                                >
+                            </div>
+                            <div class="mb-4">
+                                <label class="block text-gray-700 mb-2">新密码</label>
+                                <input 
+                                    v-model="form.newPwd" 
+                                    type="password" 
+                                    class="w-full border border-gray-300 rounded px-3 py-2"
+                                    required
+                                >
+                            </div>
+                            <div class="mb-6">
+                                <label class="block text-gray-700 mb-2">确认新密码</label>
+                                <input 
+                                    v-model="form.confirmPwd" 
+                                    type="password" 
+                                    class="w-full border border-gray-300 rounded px-3 py-2"
+                                    required
+                                >
+                            </div>
+                            <div v-if="error" class="text-red-500 mb-4">{{ error }}</div>
+                            <div v-if="success" class="text-green-500 mb-4">{{ success }}</div>
+                            <button 
+                                type="submit" 
+                                class="w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700"
+                            >
+                                修改密码
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            `,
+      // ✅ 修复：直接使用全局router对象，不通过setup参数解构
+      setup() {
+        const form = reactive({ oldPwd: '', newPwd: '', confirmPwd: '' });
+        const error = ref('');
+        const success = ref('');
+
+        const updatePwd = () => {
+          error.value = '';
+          success.value = '';
+
+          // 验证原密码
+          const admin = DB.getAdmin();
+          if (CryptoJS.MD5(form.oldPwd).toString() !== admin.password) {
+            error.value = '原密码错误';
+            return;
+          }
+
+          // 验证两次密码一致
+          if (form.newPwd !== form.confirmPwd) {
+            error.value = '两次输入的新密码不一致';
+            return;
+          }
+
+          // 修改密码
+          DB.updateAdminPassword(form.newPwd);
+          success.value = '密码修改成功，3秒后将自动退出登录';
+
+          // 3秒后退出
+          setTimeout(() => {
+            localStorage.removeItem('isLoggedIn');
+            router.push('/admin/login');
+          }, 3000);
+        };
+
+        return { form, error, success, updatePwd };
+      }
+    };
+
+    // ==================== 路由配置 ====================
+    const routes = [
+      { path: '/', component: HomePage },
+      { path: '/admin/login', component: AdminLoginPage },
+      {
+        path: '/admin',
+        component: AdminHomePage,
+        children: [
+          { path: '', component: MessageManagePage },
+          { path: 'password', component: UpdatePasswordPage }
+        ]
+      }
+    ];
+
+    const router = createRouter({
+      history: createWebHashHistory(),
+      routes
+    });
+
+    // ==================== 创建应用 ====================
+    const app = createApp({
+      template: '<router-view></router-view>'
+    });
+
+    app.use(router);
+    app.mount('#app');
+  </script>
+</body>
+
+</html>
